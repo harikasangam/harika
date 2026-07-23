@@ -4,6 +4,7 @@ import rateLimit from "express-rate-limit";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
+import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
 
@@ -11,8 +12,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
 const PORT = process.env.PORT || 3000;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = process.env.MODEL || "claude-sonnet-4-6";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const MODEL = process.env.MODEL || "gemini-2.5-flash";
+
+const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
 
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
 app.use(express.json({ limit: "1mb" }));
@@ -38,8 +41,8 @@ Your method:
 - If asked something with no educational content (chit-chat, unrelated requests), gently redirect back to studying.`;
 
 app.post("/api/chat", async (req, res) => {
-  if (!ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: "Server is not configured with an API key." });
+  if (!ai) {
+    return res.status(500).json({ error: "Server is not configured with a Gemini API key." });
   }
 
   const { messages, subject } = req.body;
@@ -47,42 +50,18 @@ app.post("/api/chat", async (req, res) => {
     return res.status(400).json({ error: "messages must be a non-empty array." });
   }
 
-  const cleanMessages = messages
+  // Format messages into Gemini contents array
+  const contents = messages
     .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
     .slice(-20)
-    .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }));
+    .map((m) => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content.slice(0, 4000) }],
+    }));
 
-  const system = subject
+  const systemInstruction = subject
     ? `${SYSTEM_PROMPT}\n\nCurrent subject focus: ${String(subject).slice(0, 100)}.`
     : SYSTEM_PROMPT;
-
-  let upstream;
-  try {
-    upstream = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 700,
-        system,
-        messages: cleanMessages,
-        stream: true,
-      }),
-    });
-  } catch (err) {
-    console.error("Failed to reach Anthropic API:", err);
-    return res.status(502).json({ error: "Could not reach the AI service." });
-  }
-
-  if (!upstream.ok || !upstream.body) {
-    const errText = await upstream.text().catch(() => "");
-    console.error("Anthropic API error:", upstream.status, errText);
-    return res.status(502).json({ error: "The AI service returned an error." });
-  }
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -91,45 +70,30 @@ app.post("/api/chat", async (req, res) => {
     "X-Accel-Buffering": "no",
   });
 
-  const reader = upstream.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
   const send = (event, data) => {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
 
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    const responseStream = await ai.models.generateContentStream({
+      model: MODEL,
+      contents: contents,
+      config: {
+        systemInstruction: systemInstruction,
+        maxOutputTokens: 700,
+      },
+    });
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop();
-
-      for (const line of lines) {
-        if (!line.startsWith("data:")) continue;
-        const payload = line.slice(5).trim();
-        if (!payload || payload === "[DONE]") continue;
-
-        try {
-          const parsed = JSON.parse(payload);
-          if (parsed.type === "content_block_delta" && parsed.delta?.text) {
-            send("token", { text: parsed.delta.text });
-          } else if (parsed.type === "message_stop") {
-            send("done", {});
-          } else if (parsed.type === "error") {
-            send("error", { message: parsed.error?.message || "Stream error" });
-          }
-        } catch {
-          // ignore malformed partial JSON lines
-        }
+    for await (const chunk of responseStream) {
+      if (chunk.text) {
+        send("token", { text: chunk.text });
       }
     }
+
+    send("done", {});
   } catch (err) {
-    console.error("Stream read error:", err);
-    send("error", { message: "The response was interrupted." });
+    console.error("Gemini API error:", err);
+    send("error", { message: err.message || "The AI service returned an error." });
   } finally {
     res.end();
   }
